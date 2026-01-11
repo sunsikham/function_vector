@@ -1,0 +1,48 @@
+{
+  "config": {
+    "model": "gpt2",
+    "layer": 0,
+    "fv_path": "artifacts/step5/fv_gpt2_layer0_n20.pt",
+    "seed": 0,
+    "n_eval": 2,
+    "alphas": [
+      0.0,
+      1.0,
+      5.0
+    ],
+    "answer_first_token": "auto",
+    "device": "cpu",
+    "dtype": "fp32",
+    "batch_size": 1
+  },
+  "fv": {
+    "shape": [
+      768
+    ],
+    "norm": 0.8971782922744751
+  },
+  "summary": [
+    {
+      "alpha": 0.0,
+      "mean_p_base": 0.02490045130252838,
+      "mean_p_with": 0.02490045130252838,
+      "mean_delta_p": 0.0,
+      "mean_delta_logit": 0.0
+    },
+    {
+      "alpha": 1.0,
+      "mean_p_base": 0.02490045130252838,
+      "mean_p_with": 0.02501056087203324,
+      "mean_delta_p": 0.00011010956950485706,
+      "mean_delta_logit": 0.09423828125
+    },
+    {
+      "alpha": 5.0,
+      "mean_p_base": 0.02490045130252838,
+      "mean_p_with": 0.025448878295719624,
+      "mean_delta_p": 0.0005484269931912422,
+      "mean_delta_logit": 0.5343399047851562
+    }
+  ],
+  "timestamp": "2026-01-03T12:35:14.279562Z"
+}
