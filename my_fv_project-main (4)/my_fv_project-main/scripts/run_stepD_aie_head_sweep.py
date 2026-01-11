@@ -754,7 +754,7 @@ def main() -> int:
                 mode="replace",
                 replace_vec=replace_vec,
                 model_config=model_cfg,
-                logger=None,
+                logger=log,
             )
             handle = layer_modules[layer].register_forward_hook(hook)
             with torch.inference_mode():
