@@ -214,13 +214,29 @@ def compute_clean_mean(
 
     for trial in trials:
         prefix = trial["clean_prefix_str"]
-        idx_map = trial["clean_idx_map"]
-        idx_avg = trial["clean_idx_avg"]
-        token_indices = list(idx_map.keys())
-        if len(token_indices) != n_slots:
+        token_labels = trial.get("clean_labels")
+        if token_labels is None:
+            token_labels, _ = build_token_labels(
+                trial["demos"],
+                trial["query"],
+                tokenizer,
+                add_special_tokens=add_special_tokens,
+            )
+        idx_map, idx_avg = compute_duplicated_labels(token_labels, dummy_labels)
+        idx_map = update_idx_map(idx_map, idx_avg)
+        class_token_indices = {slot_idx: [] for slot_idx in range(n_slots)}
+        for token_idx, slot_idx in idx_map.items():
+            if slot_idx not in class_token_indices:
+                raise ValueError(
+                    "Token index mapping mismatch: "
+                    f"slot={slot_idx} slots={n_slots}"
+                )
+            class_token_indices[slot_idx].append(token_idx)
+        empty_slots = [slot for slot, indices in class_token_indices.items() if not indices]
+        if empty_slots:
             raise ValueError(
-                "Token index mapping mismatch: "
-                f"mapped={len(token_indices)} slots={n_slots}"
+                "Token class mapping missing indices for slots: "
+                f"{empty_slots}"
             )
 
         state = {"captured": {}, "errors": []}
@@ -255,13 +271,12 @@ def compute_clean_mean(
             activation = state["captured"].get(layer)
             if activation is None:
                 raise ValueError("Failed to capture head activations")
-            stack_filtered = activation[0, token_indices].permute(1, 0, 2)
-            for span in idx_avg.values():
-                start, end = span
-                slot_idx = idx_map[start]
-                stack_filtered[:, slot_idx, :] = activation[0, start : end + 1].mean(
-                    dim=0
-                )
+            stack_filtered = torch.zeros(
+                (n_heads, n_slots, head_dim), device=activation.device
+            )
+            for slot_idx, indices in class_token_indices.items():
+                token_slice = activation[0, indices]
+                stack_filtered[:, slot_idx, :] = token_slice.mean(dim=0)
             means[layer] += stack_filtered
         total += 1
 
@@ -783,9 +798,7 @@ def main() -> int:
                 tokenizer,
                 add_special_tokens=tok_add_special,
             )
-            clean_idx_map, clean_idx_avg = compute_duplicated_labels(
-                clean_labels, dummy_labels
-            )
+            trial["clean_labels"] = clean_labels
             corrupted_labels, _ = build_token_labels(
                 trial["corrupted_demos"],
                 trial["query"],
@@ -798,8 +811,6 @@ def main() -> int:
             corrupted_idx_map_full = update_idx_map(
                 corrupted_idx_map, corrupted_idx_avg
             )
-            trial["clean_idx_map"] = clean_idx_map
-            trial["clean_idx_avg"] = clean_idx_avg
             trial["corrupted_idx_map"] = corrupted_idx_map_full
             trial["corrupted_idx_avg"] = corrupted_idx_avg
     except ValueError as exc:
