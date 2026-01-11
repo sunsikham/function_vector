@@ -20,7 +20,7 @@ from fv.io import prepare_run_dirs, resolve_out_dir, save_csv, save_json
 from fv.adapters import infer_head_dims, resolve_blocks
 from fv.hf_loader import load_hf_model_and_tokenizer
 from fv.model_spec import get_model_spec
-from fv.patch import make_cproj_head_output_replacer
+from fv.patch import make_cproj_head_output_replacer_multi
 from fv.prompting import build_prompt_qa
 from fv.slots import compute_query_predictive_slot
 
@@ -906,8 +906,9 @@ def main() -> int:
             )
             inputs = {key: value.to(device) for key, value in inputs.items()}
             last_index = inputs["input_ids"].shape[1] - 1
-            slot_index = trial["corrupted_idx_map"].get(last_index)
-            if slot_index is None:
+            token_indices = sorted(trial["corrupted_idx_map"].keys())
+            slot_indices = [trial["corrupted_idx_map"][idx] for idx in token_indices]
+            if last_index not in trial["corrupted_idx_map"]:
                 log(f"Missing slot mapping for token index {last_index}")
                 log_file.close()
                 return 1
@@ -918,13 +919,15 @@ def main() -> int:
             baseline_logit = baseline_logits[target_id].item()
             baseline_scores = compute_token_scores(baseline_logits, target_id)
 
-            replace_vec = clean_mean[layer][head][slot_index]
-            hook = make_cproj_head_output_replacer(
+            replace_vecs = [
+                clean_mean[layer][head][slot_index] for slot_index in slot_indices
+            ]
+            hook = make_cproj_head_output_replacer_multi(
                 layer_idx=layer,
                 head_idx=head,
-                token_idx=-1,
+                token_indices=token_indices,
                 mode="replace",
-                replace_vec=replace_vec,
+                replace_vecs=replace_vecs,
                 model_config=model_cfg,
                 logger=log,
             )
@@ -1030,7 +1033,7 @@ def main() -> int:
                 "attempts": attempts,
                 "kept": kept,
                 "kept_ratio": kept_ratio,
-                "token_idx": -1,
+                "token_indices": "corrupted_idx_map_all",
                 "measure": f"{args.cie_metric}[target_id]",
                 "cie_metric": args.cie_metric,
             },
