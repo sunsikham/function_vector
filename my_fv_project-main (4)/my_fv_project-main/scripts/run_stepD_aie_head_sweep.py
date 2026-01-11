@@ -93,8 +93,105 @@ def compute_token_scores(logits, target_id):
     return {"logit": logit, "p": p, "logprob": logprob}
 
 
+def build_prompt_parts_and_labels(demos, query):
+    parts = []
+    for idx, (demo_input, demo_output) in enumerate(demos, start=1):
+        parts.append(("Q: ", "structural_token"))
+        parts.append((demo_input, f"demo_{idx}_token"))
+        parts.append(("\n", "separator_token"))
+        parts.append(("A: ", "structural_token"))
+        parts.append((demo_output, f"demo_{idx}_label_token"))
+        parts.append(("\n\n", "separator_token"))
+    parts.append(("Q: ", "query_structural_token"))
+    parts.append((query[0], "query_demo_token"))
+    parts.append(("\n", "query_separator_token"))
+    parts.append(("A: ", "query_structural_token"))
+    return parts
+
+
+def labels_from_parts(parts, tokenizer, add_special_tokens: bool):
+    prompt_builder = ""
+    labels = ["bos_token"] if add_special_tokens else []
+    for text, label in parts:
+        if not text:
+            continue
+        pre = len(tokenizer.tokenize(prompt_builder))
+        prompt_builder += text
+        post = len(tokenizer.tokenize(prompt_builder))
+        added = post - pre
+        if added <= 0:
+            if labels:
+                labels[-1] = label
+            else:
+                labels.append(label)
+        else:
+            labels.extend([label] * added)
+    return labels, prompt_builder
+
+
+def build_token_labels(demos, query, tokenizer, add_special_tokens: bool):
+    parts = build_prompt_parts_and_labels(demos, query)
+    labels, prompt_str = labels_from_parts(parts, tokenizer, add_special_tokens)
+    tokens = tokenizer(prompt_str, add_special_tokens=add_special_tokens).input_ids
+    token_strs = tokenizer.convert_ids_to_tokens(tokens)
+    if len(token_strs) != len(labels):
+        if add_special_tokens and len(token_strs) == len(labels) + 1:
+            labels = labels + ["eos_token"]
+        else:
+            raise ValueError(
+                "Token label alignment mismatch: "
+                f"tokens={len(token_strs)} labels={len(labels)}"
+            )
+    return list(zip(range(len(token_strs)), token_strs, labels)), prompt_str
+
+
+def build_dummy_labels(n_icl_examples, tokenizer, add_special_tokens: bool):
+    dummy_demos = [("a", "a") for _ in range(n_icl_examples)]
+    dummy_query = ("a", "a")
+    token_labels, _ = build_token_labels(
+        dummy_demos, dummy_query, tokenizer, add_special_tokens
+    )
+    return [(idx, label) for idx, _token, label in token_labels]
+
+
+def compute_duplicated_labels(token_labels, dummy_labels):
+    check_inds = [item for item in token_labels if "demo" in item[2]]
+    label_to_indices = {}
+    dup_inds = set()
+    for idx, _token, label in check_inds:
+        label_to_indices.setdefault(label, []).append(idx)
+        if len(label_to_indices[label]) > 1:
+            dup_inds.add(idx)
+    dup_label_ranges = {
+        label: (indices[0], indices[-1])
+        for label, indices in label_to_indices.items()
+        if indices[-1] > indices[0]
+    }
+    filtered_indices = [item[0] for item in token_labels if item[0] not in dup_inds]
+    if len(filtered_indices) != len(dummy_labels):
+        raise ValueError(
+            "Token label count mismatch after de-duplication: "
+            f"filtered={len(filtered_indices)} dummy={len(dummy_labels)}"
+        )
+    index_map = {
+        token_idx: dummy_labels[pos][0]
+        for pos, token_idx in enumerate(filtered_indices)
+    }
+    return index_map, dup_label_ranges
+
+
+def update_idx_map(idx_map, idx_avg):
+    update_map = {}
+    for start, end in idx_avg.values():
+        for idx in range(start, end + 1):
+            if idx not in idx_map:
+                update_map[idx] = idx_map[start]
+    return {**idx_map, **update_map}
+
+
 def compute_clean_mean(
-    prefixes,
+    trials,
+    dummy_labels,
     model,
     tokenizer,
     device,
@@ -108,49 +205,74 @@ def compute_clean_mean(
 ):
     import torch
 
-    means = {layer: torch.zeros((n_heads, head_dim), device=device) for layer in layers}
-    counts = {layer: 0 for layer in layers}
+    n_slots = len(dummy_labels)
+    means = {
+        layer: torch.zeros((n_heads, n_slots, head_dim), device=device)
+        for layer in layers
+    }
+    total = 0
 
-    for layer in layers:
-        state = {"current": None, "errors": []}
-
-        def pre_hook(_module, inputs):
-            tensor = inputs[0] if inputs else None
-            try:
-                reshaped = reshape_resid_to_heads(tensor, n_heads, head_dim, resid_dim)
-            except ValueError as exc:
-                state["errors"].append(str(exc))
-                return
-            seq_len = reshaped.shape[1]
-            t_idx = seq_len - 1
-            state["current"] = reshaped[:, t_idx, :, :].detach().mean(dim=0)
-
-        handle = layer_modules[layer].register_forward_pre_hook(pre_hook)
-        for prefix in prefixes:
-            state["current"] = None
-            inputs = tokenizer(
-                prefix, return_tensors="pt", add_special_tokens=add_special_tokens
+    for trial in trials:
+        prefix = trial["clean_prefix_str"]
+        idx_map = trial["clean_idx_map"]
+        idx_avg = trial["clean_idx_avg"]
+        token_indices = list(idx_map.keys())
+        if len(token_indices) != n_slots:
+            raise ValueError(
+                "Token index mapping mismatch: "
+                f"mapped={len(token_indices)} slots={n_slots}"
             )
-            inputs = {key: value.to(device) for key, value in inputs.items()}
-            with torch.inference_mode():
-                _ = model(**inputs)
-            if state["errors"]:
-                handle.remove()
-                raise ValueError("; ".join(state["errors"]))
-            if state["current"] is None:
-                handle.remove()
-                raise ValueError("Failed to capture head activations")
-            means[layer] += state["current"]
-            counts[layer] += 1
-        handle.remove()
-        log(
-            f"clean_mean layer={layer} shape=({n_heads},{head_dim}) count={counts[layer]}"
-        )
 
+        state = {"captured": {}, "errors": []}
+        handles = []
+        for layer in layers:
+
+            def pre_hook(_module, inputs, layer_idx=layer):
+                tensor = inputs[0] if inputs else None
+                try:
+                    reshaped = reshape_resid_to_heads(
+                        tensor, n_heads, head_dim, resid_dim
+                    )
+                except ValueError as exc:
+                    state["errors"].append(str(exc))
+                    return
+                state["captured"][layer_idx] = reshaped.detach()
+
+            handles.append(layer_modules[layer].register_forward_pre_hook(pre_hook))
+
+        inputs = tokenizer(
+            prefix, return_tensors="pt", add_special_tokens=add_special_tokens
+        )
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+        with torch.inference_mode():
+            _ = model(**inputs)
+        for handle in handles:
+            handle.remove()
+
+        if state["errors"]:
+            raise ValueError("; ".join(state["errors"]))
+        for layer in layers:
+            activation = state["captured"].get(layer)
+            if activation is None:
+                raise ValueError("Failed to capture head activations")
+            stack_filtered = activation[0, token_indices].permute(1, 0, 2)
+            for span in idx_avg.values():
+                start, end = span
+                slot_idx = idx_map[start]
+                stack_filtered[:, slot_idx, :] = activation[0, start : end + 1].mean(
+                    dim=0
+                )
+            means[layer] += stack_filtered
+        total += 1
+
+    if total == 0:
+        raise ValueError("No clean_mean samples captured")
     for layer in layers:
-        if counts[layer] == 0:
-            raise ValueError("No clean_mean samples captured")
-        means[layer] = means[layer] / counts[layer]
+        means[layer] = means[layer] / total
+        log(
+            "clean_mean layer="
+            f"{layer} shape=({n_heads},{n_slots},{head_dim}) count={total}"
+        )
 
     return means
 
@@ -558,6 +680,9 @@ def main() -> int:
             trials.append(
                 {
                     "trial_idx": kept - 1,
+                    "demos": demos,
+                    "corrupted_demos": corrupted_demos,
+                    "query": query,
                     "clean_prefix_str": clean_prefix_str,
                     "corrupted_prefix_str": corrupted_prefix_str,
                     "target_id": clean_slot["target_id"],
@@ -611,6 +736,9 @@ def main() -> int:
             trials.append(
                 {
                     "trial_idx": trial_idx,
+                    "demos": demos,
+                    "corrupted_demos": corrupted_demos,
+                    "query": query,
                     "clean_prefix_str": clean_prefix_str,
                     "corrupted_prefix_str": corrupted_prefix_str,
                     "target_id": clean_slot["target_id"],
@@ -643,10 +771,47 @@ def main() -> int:
             return 1
         layer_modules[layer] = target_module
 
+    log("computing token labels")
+    try:
+        dummy_labels = build_dummy_labels(
+            args.n_icl_examples, tokenizer, add_special_tokens=tok_add_special
+        )
+        for trial in trials:
+            clean_labels, _ = build_token_labels(
+                trial["demos"],
+                trial["query"],
+                tokenizer,
+                add_special_tokens=tok_add_special,
+            )
+            clean_idx_map, clean_idx_avg = compute_duplicated_labels(
+                clean_labels, dummy_labels
+            )
+            corrupted_labels, _ = build_token_labels(
+                trial["corrupted_demos"],
+                trial["query"],
+                tokenizer,
+                add_special_tokens=tok_add_special,
+            )
+            corrupted_idx_map, corrupted_idx_avg = compute_duplicated_labels(
+                corrupted_labels, dummy_labels
+            )
+            corrupted_idx_map_full = update_idx_map(
+                corrupted_idx_map, corrupted_idx_avg
+            )
+            trial["clean_idx_map"] = clean_idx_map
+            trial["clean_idx_avg"] = clean_idx_avg
+            trial["corrupted_idx_map"] = corrupted_idx_map_full
+            trial["corrupted_idx_avg"] = corrupted_idx_avg
+    except ValueError as exc:
+        log(str(exc))
+        log_file.close()
+        return 1
+
     log("computing clean_mean")
     try:
         clean_mean = compute_clean_mean(
-            [t["clean_prefix_str"] for t in trials],
+            trials,
+            dummy_labels,
             model,
             tokenizer,
             device,
@@ -668,9 +833,11 @@ def main() -> int:
         {
             "layers": layers,
             "n_heads": n_heads,
+            "n_slots": len(dummy_labels),
             "head_dim": head_dim,
             "resid_dim": resid_dim,
             "model_spec": args.model_spec,
+            "dummy_labels": dummy_labels,
             "clean_mean": {layer: clean_mean[layer].cpu() for layer in layers},
         },
         clean_mean_path,
@@ -739,6 +906,11 @@ def main() -> int:
             )
             inputs = {key: value.to(device) for key, value in inputs.items()}
             last_index = inputs["input_ids"].shape[1] - 1
+            slot_index = trial["corrupted_idx_map"].get(last_index)
+            if slot_index is None:
+                log(f"Missing slot mapping for token index {last_index}")
+                log_file.close()
+                return 1
 
             with torch.inference_mode():
                 outputs = model(**inputs)
@@ -746,7 +918,7 @@ def main() -> int:
             baseline_logit = baseline_logits[target_id].item()
             baseline_scores = compute_token_scores(baseline_logits, target_id)
 
-            replace_vec = clean_mean[layer][head]
+            replace_vec = clean_mean[layer][head][slot_index]
             hook = make_cproj_head_output_replacer(
                 layer_idx=layer,
                 head_idx=head,
