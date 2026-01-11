@@ -20,7 +20,7 @@ from fv.io import prepare_run_dirs, resolve_out_dir, save_csv, save_json
 from fv.adapters import infer_head_dims, resolve_blocks
 from fv.hf_loader import load_hf_model_and_tokenizer
 from fv.model_spec import get_model_spec
-from fv.patch import make_cproj_head_replacer
+from fv.patch import make_cproj_head_output_replacer
 from fv.prompting import build_prompt_qa
 from fv.slots import compute_query_predictive_slot
 
@@ -747,7 +747,7 @@ def main() -> int:
             baseline_scores = compute_token_scores(baseline_logits, target_id)
 
             replace_vec = clean_mean[layer][head]
-            hook = make_cproj_head_replacer(
+            hook = make_cproj_head_output_replacer(
                 layer_idx=layer,
                 head_idx=head,
                 token_idx=-1,
@@ -756,7 +756,7 @@ def main() -> int:
                 model_config=model_cfg,
                 logger=None,
             )
-            handle = layer_modules[layer].register_forward_pre_hook(hook)
+            handle = layer_modules[layer].register_forward_hook(hook)
             with torch.inference_mode():
                 outputs_patched = model(**inputs)
             handle.remove()
