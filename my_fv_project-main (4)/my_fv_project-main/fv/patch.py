@@ -1,4 +1,4 @@
-"""Patch utilities for head-level replacement in c_proj pre-hooks."""
+"""Patch utilities for head-level replacement in c_proj hooks."""
 
 from typing import Optional
 
@@ -134,6 +134,91 @@ def make_cproj_head_replacer(
         if isinstance(inputs, tuple):
             return (x_patched,) + inputs[1:]
         return (x_patched,)
+
+    return hook_fn
+
+
+def make_cproj_head_output_replacer(
+    layer_idx: int,
+    head_idx: int,
+    token_idx: int,
+    mode: str,
+    replace_vec,
+    model_config: dict,
+    logger=None,
+):
+    """Create a forward hook to replace a single head vector and output.
+
+    The hook uses the module input to build a patched input, then recomputes
+    the module output using its weight (and bias, if present).
+    """
+
+    _validate_model_config(model_config)
+    n_heads = int(model_config["n_heads"])
+    head_dim = int(model_config["head_dim"])
+    resid_dim = int(model_config["resid_dim"])
+
+    if mode not in ("replace", "self"):
+        raise ValueError("mode must be 'replace' or 'self'")
+    if head_idx < 0 or head_idx >= n_heads:
+        raise ValueError("head_idx out of range")
+
+    log_state = {"logged": False}
+
+    def hook_fn(module, inputs, output):
+        if not inputs:
+            return output
+        x = inputs[0]
+        if x is None or not hasattr(x, "shape"):
+            return output
+        if x.dim() != 3:
+            raise ValueError("Expected input shape (B,T,resid_dim)")
+        batch_size, seq_len, hidden = x.shape
+        if hidden != resid_dim:
+            raise ValueError("Input resid_dim mismatch")
+
+        t_idx = _normalize_token_index(token_idx, seq_len)
+        if t_idx < 0 or t_idx >= seq_len:
+            raise ValueError("token_idx out of range")
+
+        x_heads = x.reshape(batch_size, seq_len, n_heads, head_dim)
+        if mode == "self":
+            vec = x_heads[:, t_idx, head_idx, :]
+        else:
+            if replace_vec is None:
+                raise ValueError("replace_vec required for mode='replace'")
+            vec = _normalize_replace_vec(replace_vec, batch_size, head_dim, x)
+
+        x_heads[:, t_idx, head_idx, :] = vec
+        x_patched = x_heads.reshape(batch_size, seq_len, resid_dim)
+
+        weight = getattr(module, "weight", None)
+        if weight is None:
+            raise ValueError("module missing weight for output recompute")
+        bias = getattr(module, "bias", None)
+
+        out = x_patched.matmul(weight.T)
+        if bias is not None:
+            out = out + bias
+        if output is not None and hasattr(output, "dtype"):
+            if out.dtype != output.dtype:
+                out = out.to(dtype=output.dtype)
+        if output is not None and hasattr(output, "device"):
+            if out.device != output.device:
+                out = out.to(device=output.device)
+
+        expected_hidden = weight.shape[0]
+        if out.shape != (batch_size, seq_len, expected_hidden):
+            raise ValueError("Output shape mismatch after recompute")
+
+        _log_once(
+            logger,
+            log_state,
+            "hook fired "
+            f"layer={layer_idx} head={head_idx} token_idx={token_idx} mode={mode}",
+        )
+
+        return out
 
     return hook_fn
 
