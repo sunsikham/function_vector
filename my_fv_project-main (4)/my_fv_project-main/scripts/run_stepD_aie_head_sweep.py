@@ -2,6 +2,7 @@
 """STEP D: AIE head sweep using clean-mean replacement on corrupted prompts."""
 
 import argparse
+import re
 import os
 import random
 import statistics
@@ -20,7 +21,7 @@ from fv.io import prepare_run_dirs, resolve_out_dir, save_csv, save_json
 from fv.adapters import infer_head_dims, resolve_blocks
 from fv.hf_loader import load_hf_model_and_tokenizer
 from fv.model_spec import get_model_spec
-from fv.patch import make_cproj_head_output_replacer
+from fv.patch import make_cproj_head_output_multi_replacer
 from fv.prompting import build_prompt_qa
 from fv.slots import compute_query_predictive_slot
 
@@ -97,15 +98,15 @@ def build_prompt_parts_and_labels(demos, query):
     parts = []
     for idx, (demo_input, demo_output) in enumerate(demos, start=1):
         parts.append(("Q: ", "structural_token"))
-        parts.append((demo_input, f"demo_{idx}_token"))
+        parts.append((demo_input, f"demonstration_{idx}_token"))
         parts.append(("\n", "separator_token"))
-        parts.append(("A: ", "structural_token"))
-        parts.append((demo_output, f"demo_{idx}_label_token"))
-        parts.append(("\n\n", "separator_token"))
+        parts.append(("A: ", "predictive_token"))
+        parts.append((demo_output, f"demonstration_{idx}_label_token"))
+        parts.append(("\n\n", "end_of_example_token"))
     parts.append(("Q: ", "query_structural_token"))
-    parts.append((query[0], "query_demo_token"))
+    parts.append((query[0], "query_demonstration_token"))
     parts.append(("\n", "query_separator_token"))
-    parts.append(("A: ", "query_structural_token"))
+    parts.append(("A: ", "query_predictive_token"))
     return parts
 
 
@@ -155,7 +156,7 @@ def build_dummy_labels(n_icl_examples, tokenizer, add_special_tokens: bool):
 
 
 def compute_duplicated_labels(token_labels, dummy_labels):
-    check_inds = [item for item in token_labels if "demo" in item[2]]
+    check_inds = [item for item in token_labels if "demonstration" in item[2]]
     label_to_indices = {}
     dup_inds = set()
     for idx, _token, label in check_inds:
@@ -187,6 +188,17 @@ def update_idx_map(idx_map, idx_avg):
             if idx not in idx_map:
                 update_map[idx] = idx_map[start]
     return {**idx_map, **update_map}
+
+
+def collect_token_class_indices(token_labels, token_classes, token_classes_regex):
+    token_class_indices = {}
+    for token_class, class_regex in zip(token_classes, token_classes_regex):
+        reg_class_match = re.compile(f"^{class_regex}$")
+        class_token_inds = [
+            idx for idx, _token, label in token_labels if reg_class_match.match(label)
+        ]
+        token_class_indices[token_class] = class_token_inds
+    return token_class_indices
 
 
 def compute_clean_mean(
@@ -776,6 +788,31 @@ def main() -> int:
         dummy_labels = build_dummy_labels(
             args.n_icl_examples, tokenizer, add_special_tokens=tok_add_special
         )
+        token_classes = [
+            "demonstration",
+            "label",
+            "separator",
+            "predictive",
+            "structural",
+            "end_of_example",
+            "query_demonstration",
+            "query_structural",
+            "query_separator",
+            "query_predictive",
+        ]
+        token_classes_regex = [
+            r"demonstration_[\d]{1,}_token",
+            r"demonstration_[\d]{1,}_label_token",
+            r"separator_token",
+            r"predictive_token",
+            r"structural_token",
+            r"end_of_example_token",
+            r"query_demonstration_token",
+            r"query_structural_token",
+            r"query_separator_token",
+            r"query_predictive_token",
+        ]
+        token_class_to_patch = "query_predictive"
         for trial in trials:
             clean_labels, _ = build_token_labels(
                 trial["demos"],
@@ -798,10 +835,14 @@ def main() -> int:
             corrupted_idx_map_full = update_idx_map(
                 corrupted_idx_map, corrupted_idx_avg
             )
+            class_indices = collect_token_class_indices(
+                corrupted_labels, token_classes, token_classes_regex
+            )
             trial["clean_idx_map"] = clean_idx_map
             trial["clean_idx_avg"] = clean_idx_avg
             trial["corrupted_idx_map"] = corrupted_idx_map_full
             trial["corrupted_idx_avg"] = corrupted_idx_avg
+            trial["corrupted_class_indices"] = class_indices
     except ValueError as exc:
         log(str(exc))
         log_file.close()
@@ -906,11 +947,23 @@ def main() -> int:
             )
             inputs = {key: value.to(device) for key, value in inputs.items()}
             last_index = inputs["input_ids"].shape[1] - 1
-            slot_index = trial["corrupted_idx_map"].get(last_index)
-            if slot_index is None:
-                log(f"Missing slot mapping for token index {last_index}")
+            class_token_indices = trial["corrupted_class_indices"].get(
+                token_class_to_patch, []
+            )
+            if not class_token_indices:
+                log(f"No tokens found for class {token_class_to_patch}")
                 log_file.close()
                 return 1
+            replacement_indices = []
+            replacement_vectors = []
+            for token_idx in class_token_indices:
+                slot_index = trial["corrupted_idx_map"].get(token_idx)
+                if slot_index is None:
+                    log(f"Missing slot mapping for token index {token_idx}")
+                    log_file.close()
+                    return 1
+                replacement_indices.append(token_idx)
+                replacement_vectors.append(clean_mean[layer][head][slot_index])
 
             with torch.inference_mode():
                 outputs = model(**inputs)
@@ -918,13 +971,11 @@ def main() -> int:
             baseline_logit = baseline_logits[target_id].item()
             baseline_scores = compute_token_scores(baseline_logits, target_id)
 
-            replace_vec = clean_mean[layer][head][slot_index]
-            hook = make_cproj_head_output_replacer(
+            hook = make_cproj_head_output_multi_replacer(
                 layer_idx=layer,
                 head_idx=head,
-                token_idx=-1,
-                mode="replace",
-                replace_vec=replace_vec,
+                token_indices=replacement_indices,
+                replace_vecs=replacement_vectors,
                 model_config=model_cfg,
                 logger=log,
             )
@@ -1030,7 +1081,7 @@ def main() -> int:
                 "attempts": attempts,
                 "kept": kept,
                 "kept_ratio": kept_ratio,
-                "token_idx": -1,
+                "token_class": token_class_to_patch,
                 "measure": f"{args.cie_metric}[target_id]",
                 "cie_metric": args.cie_metric,
             },

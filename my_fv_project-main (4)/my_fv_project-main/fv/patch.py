@@ -263,6 +263,92 @@ def make_cproj_head_output_replacer(
     return hook_fn
 
 
+def make_cproj_head_output_multi_replacer(
+    layer_idx: int,
+    head_idx: int,
+    token_indices,
+    replace_vecs,
+    model_config: dict,
+    logger=None,
+):
+    """Create a forward hook to replace multiple head vectors and output."""
+
+    _validate_model_config(model_config)
+    n_heads = int(model_config["n_heads"])
+    head_dim = int(model_config["head_dim"])
+    resid_dim = int(model_config["resid_dim"])
+
+    if head_idx < 0 or head_idx >= n_heads:
+        raise ValueError("head_idx out of range")
+    if len(token_indices) != len(replace_vecs):
+        raise ValueError("token_indices and replace_vecs must be the same length")
+
+    log_state = {"logged": False}
+
+    def _select_matmul(weight, resid_dim: int, module) -> str:
+        if weight.dim() != 2:
+            raise ValueError("module weight must be 2D for output recompute")
+        if weight.shape[0] == resid_dim and weight.shape[1] != resid_dim:
+            return "no_transpose"
+        if weight.shape[1] == resid_dim and weight.shape[0] != resid_dim:
+            return "transpose"
+        module_name = module.__class__.__name__
+        if module_name == "Conv1D":
+            return "no_transpose"
+        return "transpose"
+
+    def _manual_out(x_patched, weight, bias, matmul_kind: str):
+        if matmul_kind == "no_transpose":
+            out = x_patched.matmul(weight)
+        else:
+            out = x_patched.matmul(weight.T)
+        if bias is not None:
+            out = out + bias
+        return out
+
+    def hook_fn(module, inputs, output):
+        if not inputs:
+            return output
+        x = inputs[0]
+        if x is None or not hasattr(x, "shape"):
+            return output
+        if x.dim() != 3:
+            raise ValueError("Expected input shape (B,T,resid_dim)")
+        batch_size, seq_len, hidden = x.shape
+        if hidden != resid_dim:
+            raise ValueError("Input resid_dim mismatch")
+
+        x_heads = x.reshape(batch_size, seq_len, n_heads, head_dim)
+        for token_idx, replace_vec in zip(token_indices, replace_vecs):
+            t_idx = _normalize_token_index(int(token_idx), seq_len)
+            if t_idx < 0 or t_idx >= seq_len:
+                raise ValueError("token_idx out of range")
+            if replace_vec is None:
+                raise ValueError("replace_vec required")
+            vec = _normalize_replace_vec(replace_vec, batch_size, head_dim, x)
+            x_heads[:, t_idx, head_idx, :] = vec
+
+        x_patched = x_heads.reshape(batch_size, seq_len, resid_dim)
+
+        weight = getattr(module, "weight", None)
+        if weight is None:
+            raise ValueError("module missing weight for output recompute")
+        bias = getattr(module, "bias", None)
+        matmul_kind = _select_matmul(weight, resid_dim, module)
+        out = _manual_out(x_patched, weight, bias, matmul_kind)
+
+        _log_once(
+            logger,
+            log_state,
+            "hook fired "
+            f"layer={layer_idx} head={head_idx} token_indices={len(token_indices)}",
+        )
+
+        return out
+
+    return hook_fn
+
+
 def _self_test() -> None:
     """Minimal smoke test for shape handling."""
 
