@@ -164,6 +164,28 @@ def make_cproj_head_output_replacer(
         raise ValueError("head_idx out of range")
 
     log_state = {"logged": False}
+    diag_state = {"logged": False}
+
+    def _select_matmul(weight, resid_dim: int, module) -> str:
+        if weight.dim() != 2:
+            raise ValueError("module weight must be 2D for output recompute")
+        if weight.shape[0] == resid_dim and weight.shape[1] != resid_dim:
+            return "no_transpose"
+        if weight.shape[1] == resid_dim and weight.shape[0] != resid_dim:
+            return "transpose"
+        module_name = module.__class__.__name__
+        if module_name == "Conv1D":
+            return "no_transpose"
+        return "transpose"
+
+    def _manual_out(x_patched, weight, bias, matmul_kind: str):
+        if matmul_kind == "no_transpose":
+            out = x_patched.matmul(weight)
+        else:
+            out = x_patched.matmul(weight.T)
+        if bias is not None:
+            out = out + bias
+        return out
 
     def hook_fn(module, inputs, output):
         if not inputs:
@@ -197,9 +219,8 @@ def make_cproj_head_output_replacer(
             raise ValueError("module missing weight for output recompute")
         bias = getattr(module, "bias", None)
 
-        out = x_patched.matmul(weight.T)
-        if bias is not None:
-            out = out + bias
+        matmul_kind = _select_matmul(weight, resid_dim, module)
+        out = _manual_out(x_patched, weight, bias, matmul_kind)
         if output is not None and hasattr(output, "dtype"):
             if out.dtype != output.dtype:
                 out = out.to(dtype=output.dtype)
@@ -207,7 +228,7 @@ def make_cproj_head_output_replacer(
             if out.device != output.device:
                 out = out.to(device=output.device)
 
-        expected_hidden = weight.shape[0]
+        expected_hidden = weight.shape[1] if matmul_kind == "no_transpose" else weight.shape[0]
         if out.shape != (batch_size, seq_len, expected_hidden):
             raise ValueError("Output shape mismatch after recompute")
 
@@ -217,6 +238,25 @@ def make_cproj_head_output_replacer(
             "hook fired "
             f"layer={layer_idx} head={head_idx} token_idx={token_idx} mode={mode}",
         )
+
+        if not diag_state.get("logged") and hasattr(module, "forward"):
+            try:
+                forward_out = module.forward(x_patched)
+            except Exception:
+                forward_out = None
+            if forward_out is not None and hasattr(forward_out, "shape"):
+                diff = (forward_out - out).abs()
+                max_diff = diff.max().item()
+                mean_diff = diff.mean().item()
+                _log_once(
+                    logger,
+                    diag_state,
+                    "hook diagnostic "
+                    f"layer={layer_idx} head={head_idx} token_idx={token_idx} "
+                    f"mode={mode} matmul={matmul_kind} "
+                    f"weight_shape={tuple(weight.shape)} "
+                    f"max_abs_diff={max_diff:.6g} mean_abs_diff={mean_diff:.6g}",
+                )
 
         return out
 
