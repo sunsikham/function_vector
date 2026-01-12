@@ -1,0 +1,12 @@
+torch
+transformers
+accelerate
+safetensors
+einops
+numpy
+pandas
+tqdm
+rich
+python-dotenv
+matplotlib
+tqdm
